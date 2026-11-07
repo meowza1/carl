@@ -113,7 +113,6 @@ local C = {
     FOVFilled = false,
     FOVFillColor = Color3.fromRGB(166, 147, 243),
     FOVFillOpacity = 20,
-    FOVThickness = 2,
     FOVGlow = true,
     WallCheck = false,
     AliveCheck = true,
@@ -205,7 +204,8 @@ local C = {
     AimHeld = false,
     ClosestPart = false,
     Sticky = true,
-    FlyMethod = "Velocity",
+    FlyMethod = "CFrame",
+    FlySuspend = false,
     HeadDot = false,
     HeadDotColor = Color3.fromRGB(255, 255, 255),
     HeadDotSize = 4,
@@ -222,6 +222,7 @@ local C = {
     CrossSize = 12,
     CrossGap = 6,
     CrossDot = true,
+    DebugHUD = false,
 }
 
 -- Anti Void: NaN kill-height, always on. Applied at startup, on respawn,
@@ -377,6 +378,22 @@ end)
 -- True only when the executor really supports Drawing (dummy fallback tables
 -- absorb property reads as nil, so typeof check distinguishes them).
 local HAS_DRAWING = typeof(fovCircle.Visible) == "boolean"
+
+-- Debug readout: one line, top-left, toggled from Misc. A feature that
+-- silently does nothing is reportable when the numbers are on screen.
+local dbgText
+pcall(function()
+    dbgText = Drawing.new("Text")
+    dbgText.Visible = false
+    dbgText.Size = 14
+    dbgText.Center = false
+    dbgText.Outline = true
+    dbgText.Color = Color3.fromRGB(166, 147, 243)
+    dbgText.Position = Vector2.new(14, 14)
+end)
+if dbgText == nil or typeof(dbgText) == "string" then
+    dbgText = setmetatable({}, { __index = function() return nil end, __newindex = function() end })
+end
 
 -- Noclip (Nameless Admin pattern, rewritten from scratch): originals live in
 -- a weak table (dead parts evaporate on their own). step() records originals
@@ -560,10 +577,6 @@ end})
 
 FOVSection:Toggle({Name = "Fill Pulse", Flag = "FillPulse", Default = false, Callback = function(Value)
     C.FillPulse = Value
-end})
-
-FOVSection:Slider({Name = "FoV Thickness", Min = 1, Max = 5, Default = 2, Suffix = "px", Decimals = 1, Flag = "FOVThickness", Callback = function(Value)
-    C.FOVThickness = Value
 end})
 
 FOVSection:Toggle({Name = "FoV Glow", Flag = "FOVGlow", Default = true, Callback = function(Value)
@@ -791,6 +804,14 @@ MiscSection:Toggle({Name = "Vel Freeze", Flag = "DesyncVelFreeze", Default = tru
     C.DesyncVelFreeze = Value
 end})
 
+MiscSection:Toggle({Name = "Debug HUD", Flag = "DebugHUD", Default = false, Callback = function(Value)
+    C.DebugHUD = Value
+end})
+
+MiscSection:Slider({Name = "Desync Range", Min = 500, Max = 100000, Default = 50000, Suffix = " studs", Decimals = 0, Flag = "DesyncRange", Callback = function(Value)
+    C.DesyncRange = Value
+end})
+
 MiscSection:Slider({Name = "Custom X", Min = -30, Max = 30, Default = 0, Suffix = " studs", Decimals = 1, Flag = "DesyncCX", Callback = function(Value)
     C.DesyncCX = Value
 end})
@@ -906,7 +927,20 @@ FlySection:Slider({Name = "Fly Speed", Min = 10, Max = 200, Default = 60, Suffix
     C.FlySpeed = Value
 end})
 
--- NOTE: fly is CFrame-only (velocity rigs get stripped in this game).
+-- Method picks how the body is moved. CFrame writes the position directly
+-- (same mechanism as Speed, so it works wherever Speed works). Align drives an
+-- AlignPosition/AlignOrientation pair and survives controllers that rewrite
+-- velocity. Velocity is the legacy path.
+FlySection:Dropdown({Name = "Method", Flag = "FlyMethod", Default = "CFrame", Items = {"CFrame", "Align", "Velocity"}, Callback = function(Value)
+    C.FlyMethod = Value
+end})
+
+-- PlatformStand stops the humanoid controller but also removes the
+-- anti-gravity it applies, which is what made fly sink. Only turn this on if
+-- the default still fights you.
+FlySection:Toggle({Name = "Suspend Controller", Flag = "FlySuspend", Default = false, Callback = function(Value)
+    C.FlySuspend = Value
+end})
 
 SpeedSection:Toggle({Name = "Speed", Flag = "Speed", Default = false, Callback = function(Value)
     C.Speed = Value
@@ -1935,20 +1969,13 @@ local function flyPlatCleanup()
         if hum then hum.PlatformStand = false end
     end)
 end
--- Horizontal world move direction for fly. MoveDirection is world-space and
--- correct while the humanoid still reports it; the keyboard and control-module
--- fallbacks cover clients where PlatformStand zeroes MoveDirection. Returns a
--- unit XZ vector, or zero when there is no input.
+-- Horizontal world move direction for fly. MoveDirection is already world
+-- space, so it is used as-is; the keyboard and control-module fallbacks build
+-- a camera-local vector and convert it. Returns a unit XZ vector, or zero.
 local function flyMoveWorld(md, cam)
     local v = Vector3.zero
     if md and md.Magnitude > 0.01 then
         v = Vector3.new(md.X, 0, md.Z)
-        if cam then
-            -- Re-express in the current camera frame so steering follows the
-            -- look direction instantly instead of the last control tick.
-            local rel = cam.CFrame:VectorToObjectSpace(v)
-            v = cam.CFrame.RightVector * rel.X + cam.CFrame.LookVector * -rel.Z
-        end
     else
         local kx, kz = 0, 0
         if UIS:IsKeyDown(Enum.KeyCode.W) or UIS:IsKeyDown(Enum.KeyCode.Up) then kz -= 1 end
@@ -1981,6 +2008,118 @@ local function flyMoveWorld(md, cam)
     return Vector3.zero
 end
 
+-- Fly rig: AlignPosition + AlignOrientation solved by the physics engine.
+-- Used by the "Align" method, which survives a controller that rewrites
+-- velocity every frame because the constraint applies force, not velocity.
+local flyRig, flyRigHrp = nil, nil
+
+local function flyRigDestroy()
+    local r = flyRig
+    flyRig, flyRigHrp = nil, nil
+    if not r then return end
+    pcall(function()
+        if r.pos then r.pos:Destroy() end
+        if r.ori then r.ori:Destroy() end
+        if r.attach then r.attach:Destroy() end
+    end)
+end
+
+local function flyRigBuild(hrp)
+    flyRigDestroy()
+    pcall(function()
+        local attach = Instance.new("Attachment")
+        attach.Name = "syncaFlyAttachment"
+        attach.Parent = hrp
+
+        local pos = Instance.new("AlignPosition")
+        pos.Name = "syncaFlyPosition"
+        pos.Mode = Enum.PositionAlignmentMode.OneAttachment
+        pos.Attachment0 = attach
+        pos.RigidityEnabled = true
+        pos.ApplyAtCenterOfMass = true
+        pos.MaxForce = math.huge
+        pos.Responsiveness = 200
+        pos.Position = hrp.Position
+        pos.Parent = hrp
+
+        local ori = Instance.new("AlignOrientation")
+        ori.Name = "syncaFlyOrientation"
+        ori.Mode = Enum.OrientationAlignmentMode.OneAttachment
+        ori.Attachment0 = attach
+        ori.RigidityEnabled = true
+        ori.MaxTorque = math.huge
+        ori.Responsiveness = 200
+        ori.CFrame = hrp.CFrame
+        ori.Parent = hrp
+
+        flyRig = { pos = pos, ori = ori, attach = attach }
+        flyRigHrp = hrp
+    end)
+end
+
+-- One fly step. Runs before every other movement feature, inside its own
+-- pcall: a failing call in jump/speed/noclip must never abort the tick.
+local function flyStep(hrp, hum, dt)
+    local step = dt or 0.016
+    local speed = C.FlySpeed or 60
+
+    local y = 0
+    if UIS:IsKeyDown(Enum.KeyCode.Space) or UIS:IsKeyDown(Enum.KeyCode.E) or flyUpHeld then
+        y = 1
+    elseif UIS:IsKeyDown(Enum.KeyCode.Q) or UIS:IsKeyDown(Enum.KeyCode.LeftControl) or flyDownHeld then
+        y = -1
+    end
+
+    local move = flyMoveWorld(hum.MoveDirection, workspace.CurrentCamera)
+    local dir = Vector3.new(move.X, y, move.Z)
+    if dir.Magnitude > 1 then dir = dir.Unit end
+
+    -- PlatformStand kills the humanoid controller, but it also kills the
+    -- anti-gravity that controller applies — that is why fly used to sink.
+    -- Off by default; both CFrame and Align cancel the fall themselves.
+    if C.FlySuspend then
+        hum.PlatformStand = true
+        flyPlatApplied, flyPlatHum = true, hum
+    end
+
+    local vy = 0
+    pcall(function() vy = hrp.AssemblyLinearVelocity.Y end)
+
+    local method = C.FlyMethod or "CFrame"
+    if method == "Align" then
+        if flyRigHrp ~= hrp or not flyRig or not flyRig.pos or not flyRig.pos.Parent then
+            flyRigBuild(hrp)
+        end
+        if flyRig then
+            local delta = dir * speed * step
+            if y == 0 then delta += Vector3.new(0, -vy * step, 0) end
+            flyRig.pos.Position = hrp.Position + delta
+            flyRig.ori.CFrame = hrp.CFrame
+            pcall(function()
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
+            end)
+        end
+    elseif method == "Velocity" then
+        pcall(function() hrp.AssemblyLinearVelocity = dir * speed end)
+    else
+        local delta = dir * speed * step
+        -- Hover: cancel whatever the physics step added on Y while no vertical
+        -- input is held, so gravity never wins the tug-of-war.
+        if y == 0 then delta += Vector3.new(0, -vy * step, 0) end
+        hrp.CFrame += delta
+        pcall(function()
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+end
+
+local function flyRelease()
+    flyRigDestroy()
+    flyPlatCleanup()
+end
+
 local function movementTick(dt)
     pcall(function()
         local ch = LocalPlayer.Character
@@ -2001,14 +2140,27 @@ local function movementTick(dt)
         end
         if not ch or not hrp or not hum then
             if not (C.Fly or C.Speed or C.Noclip or C.JumpPower) then
-                flyPlatCleanup()
+                flyRelease()
                 unclip()
             end
             return
         end
+        -- Fly first, in its own pcall. Every other feature below shares one
+        -- pcall, so a single failing call in jump/speed/noclip used to abort
+        -- the tick before flight ever ran.
+        pcall(function()
+            if C.Fly and not hum.Seated then
+                flyStep(hrp, hum, dt)
+            else
+                flyRelease()
+            end
+        end)
         -- Jump power (saves + restores UseJumpPower too).
         if C.JumpPower then
-            if not jumpApplied then jumpOrig, jumpUsePowOrig, jumpHum = hum.JumpPower, hum.UseJumpPower, hum jumpApplied = true end
+            if not jumpApplied then
+                jumpOrig, jumpUsePowOrig, jumpHum = hum.JumpPower, hum.UseJumpPower, hum
+                jumpApplied = true
+            end
             hum.UseJumpPower = true
             hum.JumpPower = (C.JumpPowerAmount or 50)
         elseif jumpApplied then
@@ -2068,31 +2220,13 @@ local function movementTick(dt)
             unclip()
         end
         if hum.Seated then
-            flyPlatCleanup()
+            flyRelease()
             return
         end
         local md = hum.MoveDirection
-        if C.Fly then
-            local y = 0
-            if UIS:IsKeyDown(Enum.KeyCode.Space) or UIS:IsKeyDown(Enum.KeyCode.E) or flyUpHeld then y = 1
-            elseif UIS:IsKeyDown(Enum.KeyCode.Q) or UIS:IsKeyDown(Enum.KeyCode.LeftControl) or flyDownHeld then y = -1 end
-            local cam = workspace.CurrentCamera
-            local move = flyMoveWorld(md, cam)
-            local dir = Vector3.new(move.X, y, move.Z)
-            if dir.Magnitude > 1 then dir = dir.Unit end
-            -- CFrame-only: step along dir with the controller suspended. Zero
-            -- the velocity first so gravity and knockback cannot accumulate
-            -- between physics ticks and drag the body off the flight path.
-            hum.PlatformStand = true
-            flyPlatApplied, flyPlatHum = true, hum
-            pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
-            hrp.CFrame += dir * (C.FlySpeed or 60) * (dt or 0.016)
-        else
-            flyPlatCleanup()
-            if C.Speed and md.Magnitude > 0.01 then
-                -- CFrame-only speed (+ WalkSpeed assist above).
-                hrp.CFrame += md * (C.SpeedAmount or 16) * (dt or 0.016)
-            end
+        if not C.Fly and C.Speed and md.Magnitude > 0.01 then
+            -- CFrame-only speed (+ WalkSpeed assist above).
+            hrp.CFrame += md * (C.SpeedAmount or 16) * (dt or 0.016)
         end
     end)
 end
@@ -2306,8 +2440,15 @@ RSVC.RenderStepped:Connect(function()
     if C.Desync and desyncDisplaced then desyncRestore() end
 end)
 
+-- Displacement magnitude. Roblox is float32: a CFrame hundreds of millions of
+-- studs out loses precision and the engine can drop the part, which is why the
+-- old 9e8 offsets produced no visible desync at all. 50k is far off-map and
+-- still inside the range physics handles cleanly.
+local DESYNC_RANGE = 50000
+
 local function desyncTargetFor(old)
     local mode = C.DesyncMode or "Void"
+    local R = C.DesyncRange or DESYNC_RANGE
     if mode == "Pulse" then
         local now = os.clock()
         if desyncPhaseT == 0 then desyncPhaseT = now desyncVoidPhase = true end
@@ -2317,20 +2458,20 @@ local function desyncTargetFor(old)
             desyncVoidPhase = true desyncPhaseT = now
         end
         if not desyncVoidPhase then return old, false end
-        return CFrame.new(old.Position + Vector3.new(math.random(-900000000, 900000000), math.random(100000000, 900000000), math.random(-900000000, 900000000))), true
+        return CFrame.new(old.Position + Vector3.new(math.random(-R, R), math.random(R * 0.5, R), math.random(-R, R))), true
     elseif mode == "Underground" then
         return CFrame.new(old.Position - Vector3.new(0, (C.UndergroundDepth or 6), 0)) * CFrame.Angles(math.pi / 2, 0, 0), true
     elseif mode == "Chaos" then
         local t = os.clock() * 17
-        return CFrame.new(old.Position + Vector3.new(math.sin(t) * 900000000, math.abs(math.cos(t * 1.3)) * 900000000, math.sin(t * 0.7) * 900000000)), true
+        return CFrame.new(old.Position + Vector3.new(math.sin(t) * R, math.abs(math.cos(t * 1.3)) * R, math.sin(t * 0.7) * R)), true
     elseif mode == "Epilepsy" then
         local flip = math.floor(os.clock() * 60) % 2 == 0
-        local o = flip and Vector3.new(900000000, 900000000, 900000000) or Vector3.new(-900000000, -900000000, -900000000)
+        local o = flip and Vector3.new(R, R, R) or Vector3.new(-R, -R, -R)
         return CFrame.new(old.Position + o), true
     elseif mode == "Custom" then
         return old + Vector3.new((C.DesyncCX or 0), (C.DesyncCY or 6), (C.DesyncCZ or 0)), true
     else -- Void: every tick flung far up/out
-        return CFrame.new(old.Position + Vector3.new(math.random(-900000000, 900000000), math.random(100000000, 900000000), math.random(-900000000, 900000000))), true
+        return CFrame.new(old.Position + Vector3.new(math.random(-R, R), math.random(R * 0.5, R), math.random(-R, R))), true
     end
 end
 
@@ -2434,12 +2575,12 @@ local function mainFrame(dt)
         fovCircle.Position = anchor
         fovCircle.Radius = C.FOVSize
         fovCircle.Transparency = C.FOVOpacity / 100
-        fovCircle.Thickness = C.FOVThickness
+        fovCircle.Thickness = 2
         -- Glow: fat, faded copy of the ring on the same radius, drawn behind.
         fovGlow.Position = anchor
         fovGlow.Radius = C.FOVSize
         fovGlow.Color = C.FoVColor
-        fovGlow.Thickness = C.FOVThickness + 6
+        fovGlow.Thickness = 8
         fovGlow.Transparency = math.clamp(C.FOVOpacity / 100 + 0.45, 0, 1)
         -- Fill sits just inside the ring stroke so the ring stays crisp, and
         -- supports rainbow cycling plus a breathing pulse animation
@@ -2452,7 +2593,7 @@ local function mainFrame(dt)
             fillOp *= (0.55 + 0.45 * math.sin(os.clock() * 4))
         end
         fovFill.Position = anchor
-        fovFill.Radius = math.max(C.FOVSize - C.FOVThickness / 2, 1)
+        fovFill.Radius = math.max(C.FOVSize - 1, 1)
         fovFill.Color = fillColor
         fovFill.Transparency = fillOp
 
@@ -2464,7 +2605,7 @@ local function mainFrame(dt)
         end
         fovOutline.Position = anchor
         fovOutline.Radius = C.FOVSize
-        fovOutline.Thickness = C.FOVThickness + 2
+        fovOutline.Thickness = 4
         fovOutline.Color = outlineColor
         fovOutline.Transparency = C.OutlineOpacity / 100
         fovCircle.Visible = C.FOV
@@ -2519,6 +2660,33 @@ local function mainFrame(dt)
                 chODot.Position = Vector2.new(ccx, ccy)
             end
         end)
+
+        -- Debug HUD: live state of the two features that fail silently.
+        if dbgText then
+            if C.DebugHUD then
+                local ch = LocalPlayer.Character
+                local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+                local vy = 0
+                if hrp then
+                    pcall(function()
+                        vy = hrp.AssemblyLinearVelocity.Y
+                    end)
+                end
+                dbgText.Visible = true
+                dbgText.Text = string.format(
+                    "fly %s%s  vy %.1f  |  desync %s  active %s  range %.0f",
+                    tostring(C.FlyMethod),
+                    C.FlySuspend and " +stand" or "",
+                    vy,
+                    tostring(C.DesyncMode),
+                    desyncDisplaced and "yes" or "no",
+                    C.DesyncRange or DESYNC_RANGE
+                )
+                dbgText.Color = C.Fly and Color3.fromRGB(120, 255, 150) or Color3.fromRGB(166, 147, 243)
+            else
+                dbgText.Visible = false
+            end
+        end
 
         updateHighlight()
         updateESP(dt)
