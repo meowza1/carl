@@ -1,6 +1,107 @@
 -- synca vendored build: mobile-patched Thugsense fork hosted in this repo
 local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/ywhshhs/synca/main/Thugsense/Library.lua"))()
 
+-- Theme: near-black violet, matched to the default FoV ring color. Applied
+-- through ChangeTheme so every themed element picks it up as it is created.
+do
+    local palette = {
+        ["Background"] = Color3.fromRGB(11, 11, 15),
+        ["Inline"] = Color3.fromRGB(16, 16, 22),
+        ["Page Background"] = Color3.fromRGB(23, 23, 31),
+        ["Border"] = Color3.fromRGB(7, 7, 10),
+        ["Outline"] = Color3.fromRGB(36, 36, 48),
+        ["Accent"] = Color3.fromRGB(166, 147, 243),
+        ["Element"] = Color3.fromRGB(29, 29, 39),
+        ["Hovered Element"] = Color3.fromRGB(43, 43, 57),
+        ["Text"] = Color3.fromRGB(198, 198, 214),
+        ["Text Border"] = Color3.fromRGB(0, 0, 0),
+    }
+    for key, color in palette do
+        pcall(function() Library:ChangeTheme(key, color) end)
+    end
+end
+
+-- Config persistence fixes for the vendored Library:
+--   * SaveConfig built "scriptname/scriptname/Configs/x.json" and then only
+--     wrote when that impossible path already existed, so Save silently did
+--     nothing. Write to the real folder, create-if-missing.
+--   * RefreshConfigsList stripped a Windows-style prefix, so list entries kept
+--     full paths and Load then prepended the folder again. Take the basename.
+--   * LoadConfig decoded without a guard; a corrupt autoload killed the thread.
+do
+    local HttpService = game:GetService("HttpService")
+
+    local function configPath(self, name)
+        return self.Folders.Configs .. "/" .. name
+    end
+
+    Library.SaveConfig = function(self, Config)
+        if type(Config) ~= "string" or Config == "" then return end
+        if Config:sub(-5) ~= ".json" then Config = Config .. ".json" end
+        local ok = pcall(function()
+            writefile(configPath(self, Config), self:GetConfig())
+        end)
+        if ok then
+            self:Notification("Saved " .. Config, 3, Color3.fromRGB(0, 255, 0))
+        else
+            self:Notification("Save failed: " .. Config, 3, Color3.fromRGB(255, 80, 80))
+        end
+    end
+
+    Library.DeleteConfig = function(self, Config)
+        if type(Config) ~= "string" or Config == "" then return end
+        local path = configPath(self, Config)
+        if isfile(path) then
+            pcall(delfile, path)
+            self:Notification("Deleted " .. Config, 3, Color3.fromRGB(0, 255, 0))
+        end
+    end
+
+    Library.RefreshConfigsList = function(self, Element)
+        if not Element then return end
+        local list = {}
+        local ok, files = pcall(function() return listfiles(self.Folders.Configs) end)
+        if ok and type(files) == "table" then
+            for _, path in ipairs(files) do
+                local name = tostring(path):match("([^/\\]+)$")
+                if name and name:sub(-5) == ".json" then
+                    table.insert(list, name)
+                end
+            end
+        end
+        table.sort(list)
+        Element:Refresh(list)
+    end
+
+    Library.LoadConfig = function(self, Config)
+        if type(Config) ~= "string" or Config == "" then return end
+        local okDecode, decoded = pcall(function()
+            return HttpService:JSONDecode(Config)
+        end)
+        if not okDecode or type(decoded) ~= "table" then
+            self:Notification("Config is not valid JSON", 3, Color3.fromRGB(255, 80, 80))
+            return
+        end
+        local applied = 0
+        for Index, Value in decoded do
+            local set = self.SetFlags[Index]
+            if set then
+                local ok = pcall(function()
+                    if type(Value) == "table" and Value.Key then
+                        set(Value)
+                    elseif type(Value) == "table" and Value.Color then
+                        set(Value.Color, Value.Alpha)
+                    else
+                        set(Value)
+                    end
+                end)
+                if ok then applied += 1 end
+            end
+        end
+        self:Notification("Loaded config (" .. applied .. " settings)", 3, Color3.fromRGB(0, 255, 0))
+    end
+end
+
 -- Config storage (defined first so callbacks never hit nil)
 local C = {
     Enable = false,
@@ -13,6 +114,7 @@ local C = {
     FOVFillColor = Color3.fromRGB(166, 147, 243),
     FOVFillOpacity = 20,
     FOVThickness = 2,
+    FOVGlow = true,
     WallCheck = false,
     AliveCheck = true,
     Smoothness = 10,
@@ -160,6 +262,25 @@ pcall(function()
     fovOutline.Radius = 100
 end)
 
+-- Soft glow ring: same radius, fat and mostly transparent, sits behind the
+-- crisp ring so the FoV edge reads on busy backgrounds.
+local fovGlow
+pcall(function()
+    fovGlow = Drawing.new("Circle")
+end)
+if fovGlow == nil or typeof(fovGlow) == "string" then
+    fovGlow = setmetatable({}, { __index = function() return nil end, __newindex = function() end })
+end
+pcall(function()
+    fovGlow.Visible = false
+    fovGlow.Filled = false
+    fovGlow.NumSides = 64
+    fovGlow.Color = Color3.fromRGB(166, 147, 243)
+    fovGlow.Thickness = 8
+    fovGlow.Transparency = 0.75
+    fovGlow.Radius = 100
+end)
+
 local fovCircle
 do
     local ok, obj = pcall(function() return Drawing.new("Circle") end)
@@ -199,8 +320,28 @@ pcall(function()
     fovFill.Radius = 100
 end)
 
--- Screen-center crosshair overlay (4 lines + dot)
+-- Screen-center crosshair overlay (4 lines + dot) with a fat black underlay
+-- created first, so the picked color stays readable against sky and walls.
 local chT, chB, chL, chR, chDot = nil, nil, nil, nil, nil
+local chOT, chOB, chOL, chOR, chODot = nil, nil, nil, nil, nil
+pcall(function()
+    chOT = Drawing.new("Line")
+    chOB = Drawing.new("Line")
+    chOL = Drawing.new("Line")
+    chOR = Drawing.new("Line")
+    for _, ln in ipairs({chOT, chOB, chOL, chOR}) do
+        ln.Visible = false
+        ln.Thickness = 3
+        ln.Color = Color3.fromRGB(0, 0, 0)
+        ln.Transparency = 0.55
+    end
+    chODot = Drawing.new("Circle")
+    chODot.Visible = false
+    chODot.Filled = true
+    chODot.Radius = 3.5
+    chODot.Color = Color3.fromRGB(0, 0, 0)
+    chODot.Transparency = 0.55
+end)
 pcall(function()
     chT = Drawing.new("Line")
     chB = Drawing.new("Line")
@@ -423,6 +564,10 @@ end})
 
 FOVSection:Slider({Name = "FoV Thickness", Min = 1, Max = 5, Default = 2, Suffix = "px", Decimals = 1, Flag = "FOVThickness", Callback = function(Value)
     C.FOVThickness = Value
+end})
+
+FOVSection:Toggle({Name = "FoV Glow", Flag = "FOVGlow", Default = true, Callback = function(Value)
+    C.FOVGlow = Value
 end})
 
 local OutlineToggle = FOVSection:Toggle({Name = "FoV Outline", Flag = "FOVOutline", Default = false, Callback = function(Value)
@@ -1790,6 +1935,52 @@ local function flyPlatCleanup()
         if hum then hum.PlatformStand = false end
     end)
 end
+-- Horizontal world move direction for fly. MoveDirection is world-space and
+-- correct while the humanoid still reports it; the keyboard and control-module
+-- fallbacks cover clients where PlatformStand zeroes MoveDirection. Returns a
+-- unit XZ vector, or zero when there is no input.
+local function flyMoveWorld(md, cam)
+    local v = Vector3.zero
+    if md and md.Magnitude > 0.01 then
+        v = Vector3.new(md.X, 0, md.Z)
+        if cam then
+            -- Re-express in the current camera frame so steering follows the
+            -- look direction instantly instead of the last control tick.
+            local rel = cam.CFrame:VectorToObjectSpace(v)
+            v = cam.CFrame.RightVector * rel.X + cam.CFrame.LookVector * -rel.Z
+        end
+    else
+        local kx, kz = 0, 0
+        if UIS:IsKeyDown(Enum.KeyCode.W) or UIS:IsKeyDown(Enum.KeyCode.Up) then kz -= 1 end
+        if UIS:IsKeyDown(Enum.KeyCode.S) or UIS:IsKeyDown(Enum.KeyCode.Down) then kz += 1 end
+        if UIS:IsKeyDown(Enum.KeyCode.A) or UIS:IsKeyDown(Enum.KeyCode.Left) then kx -= 1 end
+        if UIS:IsKeyDown(Enum.KeyCode.D) or UIS:IsKeyDown(Enum.KeyCode.Right) then kx += 1 end
+        if kx ~= 0 or kz ~= 0 then
+            v = Vector3.new(kx, 0, kz).Unit
+            if cam then
+                v = cam.CFrame.RightVector * v.X + cam.CFrame.LookVector * -v.Z
+            end
+        else
+            -- Touch: raw thumbstick vector from the player's control module.
+            local ok, mv = pcall(function()
+                local pm = LocalPlayer:FindFirstChild("PlayerScripts")
+                pm = pm and pm:FindFirstChild("PlayerModule")
+                local controls = pm and pm:GetControls()
+                return controls and controls:GetMoveVector()
+            end)
+            if ok and typeof(mv) == "Vector3" and mv.Magnitude > 0.01 then
+                v = Vector3.new(mv.X, 0, mv.Z)
+                if cam then
+                    v = cam.CFrame:VectorToWorldSpace(v)
+                end
+            end
+        end
+    end
+    v = Vector3.new(v.X, 0, v.Z)
+    if v.Magnitude > 0.01 then return v.Unit end
+    return Vector3.zero
+end
+
 local function movementTick(dt)
     pcall(function()
         local ch = LocalPlayer.Character
@@ -1885,25 +2076,16 @@ local function movementTick(dt)
             local y = 0
             if UIS:IsKeyDown(Enum.KeyCode.Space) or UIS:IsKeyDown(Enum.KeyCode.E) or flyUpHeld then y = 1
             elseif UIS:IsKeyDown(Enum.KeyCode.Q) or UIS:IsKeyDown(Enum.KeyCode.LeftControl) or flyDownHeld then y = -1 end
-            -- Camera-relative steering: thumbstick/keyboard dir follows look.
             local cam = workspace.CurrentCamera
-            local move = md
-            if cam and md.Magnitude > 0.01 then
-                local fwd = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
-                local rgt = Vector3.new(cam.CFrame.RightVector.X, 0, cam.CFrame.RightVector.Z)
-                if fwd.Magnitude > 0.01 and rgt.Magnitude > 0.01 then
-                    fwd, rgt = fwd.Unit, rgt.Unit
-                    local rel = cam.CFrame:PointToObjectSpace(hrp.Position + md)
-                    move = (rgt * -rel.X) + (fwd * -rel.Z)
-                    if move.Magnitude > 1 then move = move.Unit end
-                end
-            end
+            local move = flyMoveWorld(md, cam)
             local dir = Vector3.new(move.X, y, move.Z)
             if dir.Magnitude > 1 then dir = dir.Unit end
-            -- CFrame-only: teleport along dir, controller suspended so
-            -- nothing fights it. No velocity writes at all.
+            -- CFrame-only: step along dir with the controller suspended. Zero
+            -- the velocity first so gravity and knockback cannot accumulate
+            -- between physics ticks and drag the body off the flight path.
             hum.PlatformStand = true
             flyPlatApplied, flyPlatHum = true, hum
+            pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
             hrp.CFrame += dir * (C.FlySpeed or 60) * (dt or 0.016)
         else
             flyPlatCleanup()
@@ -2253,6 +2435,12 @@ local function mainFrame(dt)
         fovCircle.Radius = C.FOVSize
         fovCircle.Transparency = C.FOVOpacity / 100
         fovCircle.Thickness = C.FOVThickness
+        -- Glow: fat, faded copy of the ring on the same radius, drawn behind.
+        fovGlow.Position = anchor
+        fovGlow.Radius = C.FOVSize
+        fovGlow.Color = C.FoVColor
+        fovGlow.Thickness = C.FOVThickness + 6
+        fovGlow.Transparency = math.clamp(C.FOVOpacity / 100 + 0.45, 0, 1)
         -- Fill sits just inside the ring stroke so the ring stays crisp, and
         -- supports rainbow cycling plus a breathing pulse animation
         local fillColor = C.FOVFillColor
@@ -2280,6 +2468,7 @@ local function mainFrame(dt)
         fovOutline.Color = outlineColor
         fovOutline.Transparency = C.OutlineOpacity / 100
         fovCircle.Visible = C.FOV
+        fovGlow.Visible = C.FOV and C.FOVGlow
         fovFill.Visible = C.FOV and C.FOVFilled
         fovOutline.Visible = C.FOV and C.FOVOutline
 
@@ -2305,10 +2494,29 @@ local function mainFrame(dt)
             chR.From = Vector2.new(ccx + cg, ccy)
             chR.To = Vector2.new(ccx + cg + cl, ccy)
             chR.Color = C.CrossColor
+            -- Underlay shares the geometry; its extra thickness is the border.
+            if chOT then
+                chOT.Visible = showX
+                chOT.From = chT.From
+                chOT.To = chT.To
+                chOB.Visible = showX
+                chOB.From = chB.From
+                chOB.To = chB.To
+                chOL.Visible = showX
+                chOL.From = chL.From
+                chOL.To = chL.To
+                chOR.Visible = showX
+                chOR.From = chR.From
+                chOR.To = chR.To
+            end
             if chDot then
                 chDot.Visible = showX and C.CrossDot
                 chDot.Position = Vector2.new(ccx, ccy)
                 chDot.Color = C.CrossColor
+            end
+            if chODot then
+                chODot.Visible = showX and C.CrossDot
+                chODot.Position = Vector2.new(ccx, ccy)
             end
         end)
 
@@ -2366,6 +2574,7 @@ local function mainFrame(dt)
             ringColor = C.LockedColor
         end
         fovCircle.Color = ringColor
+        fovGlow.Color = ringColor
 
         -- Target Dot on the locked aim point
         if C.TargetDot and AIMBOT.Target then
